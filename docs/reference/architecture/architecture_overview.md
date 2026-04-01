@@ -196,17 +196,84 @@ MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/m
 3. The engine samples the first generated token from the final timestep (respecting overrides for `algorithm`, `topk`, `nucleus_topp`, `temperature`) and returns it alongside the cached state and `next_pos` (advanced to the prompt length, plus any `mrope_deltas`).
 4. If `return_prompt_logp` is set, the engine also computes per-token log-probs from the flat logits. When `stack_prefill_result_cache` is enabled, caches are stacked along an extra axis (ordered by `prefill_cache_axis_order`) so a single prefill call can serve multiple packed prompts.
 
+```python
+# src/maxtext/inference/maxengine/maxengine.py:_prefill_jit
+if existing_prefix is not None:
+  input_params = params | {"cache": existing_prefix.cache}
+  start_position = existing_prefix.common_prefix_tokens.shape[0]
+  previous_chunk = jnp.expand_dims(existing_prefix.common_prefix_tokens, 0)
+
+with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+  flat_logits, new_vars = self.model.apply(
+      input_params,
+      input_tokens,
+      positions,
+      decoder_segment_ids=sequence_indicator,
+      enable_dropout=False,
+      model_mode=MODEL_MODE_PREFILL,
+      rngs={"params": new_rng},
+      mutable=["cache"],
+      previous_chunk=previous_chunk,
+      true_length=true_length,
+      slot=slot,
+      page_state=page_state,
+  )
+first_generated_token = inference_utils.sampling(
+    selected_logits,
+    new_rng,
+    algorithm if algorithm is not None else self.config.decode_sampling_strategy,
+    topk=topk if topk is not None else self.config.decode_sampling_top_k,
+    nucleus_topp=nucleus_topp if nucleus_topp is not None else self.config.decode_sampling_nucleus_p,
+    temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
+)
+cache = self._maybe_stack_prefill_result_cache(new_vars["cache"])
+```
+
 ### KV cache lifecycle
 
 - Prefill caches are produced with `prefill_kv_cache_shardings` and optionally stacked. Before decode, the engine "unboxes" and, if needed, unstacks the cache to match the decode-time layout (`kv_cache_shardings`).
 - In chunked or packed prefill, helper paths like `bulk_insert` and `insert_prefill` copy the prefill cache into the decode state's full KV buffers, zero-filling any future timesteps that were not part of the prefill chunk and copying the key/value scale tensors (`cached_prefill_key/value(_scale)`) that accompany quantized or paged caches.
 - With paged attention, `PageManager` assigns and later releases page groups per slot, letting long prompts reuse physical cache pages without reallocating HBM.
 
+```python
+# src/maxtext/inference/maxengine/maxengine.py:bulk_insert
+if path_key == "cache_prefill_segment_id":
+  zeros = jnp.zeros(tuple(s), dtype=jnp.int32)              # zero uncovered steps
+  full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, zeros, slot, batch_idx)
+  full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
+elif path_key in [
+    "cached_prefill_key",
+    "cached_prefill_value",
+    "cached_prefill_key_scale",
+    "cached_prefill_value_scale",
+]:
+  full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
+```
+
 ### Decode loop
 
 - `init_decode_state` shapes an empty decode state (logits placeholder, KV cache, `next_pos`, counters) and annotates it with shardings derived from the logical axis rules. Donation (`donate_argnums`) is used in `_generate_jit` to avoid extra buffers during autoregressive steps.
 - Each `generate` call updates page reservations, splits RNG, and runs a single-step model apply in `MODEL_MODE_AUTOREGRESSIVE`, feeding the previous token and position. Outputs are constrained to the replicated sharding for logits and to `kv_cache_shardings` for caches to keep the layout stable across steps.
 - The engine samples a new token, increments `next_pos` and `generated_tokens`, and returns both the updated decode state (ready for the next step) and an `engine_api.ResultTokens` envelope consumed by JetStream.
+
+```python
+# src/maxtext/inference/maxengine/maxengine.py:_generate_jit
+with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+  out_logits, new_vars = self.model.apply(
+      params | {"cache": decode_state["cache"]},
+      previous_token,
+      decode_state["next_pos"],
+      enable_dropout=False,
+      model_mode=MODEL_MODE_AUTOREGRESSIVE,
+      rngs={"params": new_rng},
+      mutable=["cache"],
+      page_state=page_state,
+  )
+out_logits = jax.lax.with_sharding_constraint(out_logits, self.replicated_sharding)
+new_cache = jax.lax.with_sharding_constraint(new_vars["cache"], self.kv_cache_shardings)
+new_token = inference_utils.sampling(out_logits, new_rng, self.config.decode_sampling_strategy, ...)
+next_pos = decode_state["next_pos"] + 1
+```
 
 ### How parallelism choices affect prefill, cache, and decode
 
