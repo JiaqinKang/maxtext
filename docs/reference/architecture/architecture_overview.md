@@ -180,3 +180,48 @@ Debugging performance issues in a distributed system with thousands of accelerat
 - Stack trace collection: To diagnose program hangs or faults, users can set `collect_stack_trace: True` in the configuration. This feature will periodically dump the Python stack traces from all worker processes. The traces can be directed to the console for immediate inspection or, more scalably, uploaded to Cloud Logging, where they can be aggregated and queried to identify misbehaving nodes.
 - HLO dumping: For deep, low-level performance analysis, MaxText allows users to dump the XLA High-Level Optimizer (HLO) graph. By setting the `dump_hlo` flag, the compiled graph for a specific training step can be saved to a local directory or uploaded to Cloud Storage. This HLO representation is invaluable for compiler engineers and advanced users who need to understand exactly how XLA is interpreting and optimizing the model, making it possible to debug subtle performance regressions or compiler-related issues.
 - Goodput monitoring: The framework integrates with the ml-goodput-measurement library, which provides a more holistic view of job efficiency than simple TFLOPs calculations. This allows for the tracking of metrics that capture overall "goodput," accounting for factors like data loading time, compilation overhead, and idle time, giving a truer picture of end-to-end performance.
+
+## Inference runtime: MaxEngine internals
+
+MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/maxengine/maxengine.py`), the JetStream-compatible runtime that drives prefill and decode. The engine builds a Flax transformer with JAX logical axis rules applied to a device mesh created from the configured `mesh_axes` and `ici/dcn_parallelism`. It initializes:
+
+- A model compiled for prefill mode (`MODEL_MODE_PREFILL`) with quantization wired from `quantizations.configure_quantization`.
+- Sharding layouts for parameters, decode state, and KV caches (`prefill_kv_cache_annotations` for prefill and `kv_cache_annotations` for autoregressive decode).
+- Optional paged-attention bookkeeping via `PageManager` when `attention: paged` is set, which allocates cache pages per request slot.
+
+### Prefill pipeline
+
+1. Inputs are padded to `max_prefill_predict_length` and optionally chunked (`use_chunked_prefill` / `prefill_chunk_size`). When an `existing_prefix` is supplied, the previous chunk's KV cache is spliced in and positions are offset to resume mid-prompt.
+2. Under the JAX mesh and logical axis rules, the model runs in prefill mode, producing logits and a KV cache stored in the mutable `"cache"` collection. For paged attention, the page manager reserves pages for the slot before the JIT call.
+3. The engine samples the first generated token from the final timestep (respecting overrides for `algorithm`, `topk`, `nucleus_topp`, `temperature`) and returns it alongside the cached state and `next_pos` (advanced to the prompt length, plus any `mrope_deltas`).
+4. If `return_prompt_logp` is set, the engine also computes per-token log-probs from the flat logits. When `stack_prefill_result_cache` is enabled, caches are stacked along an extra axis (ordered by `prefill_cache_axis_order`) so a single prefill call can serve multiple packed prompts.
+
+### KV cache lifecycle
+
+- Prefill caches are produced with `prefill_kv_cache_shardings` and optionally stacked. Before decode, the engine "unboxes" and, if needed, unstacks the cache to match the decode-time layout (`kv_cache_shardings`).
+- In chunked or packed prefill, helper paths like `bulk_insert` and `insert_prefill` copy the prefill cache into the decode state's full KV buffers, zero-filling any uncovered timesteps and copying scale metadata (`cached_prefill_key/value(_scale)`).
+- With paged attention, `PageManager` assigns and later releases page groups per slot, letting long prompts reuse physical cache pages without reallocating HBM.
+
+### Decode loop
+
+- `init_decode_state` shapes an empty decode state (logits placeholder, KV cache, `next_pos`, counters) and annotates it with shardings derived from the logical axis rules. Donation (`donate_argnums`) is used in `_generate_jit` to avoid extra buffers during autoregressive steps.
+- Each `generate` call updates page reservations, splits RNG, and runs a single-step model apply in `MODEL_MODE_AUTOREGRESSIVE`, feeding the previous token and position. Outputs are constrained to the replicated sharding for logits and to `kv_cache_shardings` for caches to keep the layout stable across steps.
+- The engine samples a new token, increments `next_pos` and `generated_tokens`, and returns both the updated decode state (ready for the next step) and an `engine_api.ResultTokens` envelope consumed by JetStream.
+
+### How parallelism choices affect prefill, cache, and decode
+
+- **Mesh shape (`ici_parallelism`, `dcn_parallelism`) and axis rules** decide how both parameters and KV caches are partitioned. Data/FSDP axes replicate or shard caches across replicas; tensor/sequence axes shard head and sequence dimensions, reducing per-device KV size but requiring collective ops during attention.
+- **Stacked/packed prefill** (`stack_prefill_result_cache`, `prefill_cache_axis_order`) adds a leading stacking axis to the cache layout so a single compiled prefill can service multiple packed prompts; this changes sharding to include an extra `None` dimension.
+- **Paged attention** moves KV cache residency from contiguous HBM blocks to reusable pages; with more data-parallel replicas, page allocations are independent per replica, while tensor-parallel layouts still shard keys/values within each page.
+- **Chunked prefill** keeps per-step activation and cache shapes bounded by `prefill_chunk_size`, which is especially important when the mesh uses narrow tensor-parallel slices (smaller per-device head dim) or deep pipeline stages. Larger meshes reduce wall-clock time per chunk but may increase collective overhead during cache stitching.
+- **Greedy vs. sampling decode** does not change sharding, but higher data-parallel width increases the number of concurrent decode states; ensure `per_device_batch_size` is sized so `per_device_batch_size * mesh.size` fits KV cache memory under the chosen parallel layout.
+
+### Configuration quick reference
+
+| Setting | Purpose |
+| --- | --- |
+| `use_chunked_prefill`, `prefill_chunk_size` | Split long prompts into manageable chunks; required when resuming with `existing_prefix`. |
+| `stack_prefill_result_cache`, `prefill_cache_axis_order` | Stack packed prompts' caches along an extra axis so a single prefill serves multiple prefixes. |
+| `max_prefill_predict_length`, `max_target_length` | Bound prefill and decode lengths; drive cache allocation size. |
+| `attention: paged` | Enable paged KV management; page manager allocates per-slot pages before/after prefill/decode. |
+| `mesh_axes`, `logical_axis_rules`, `ici_parallelism`, `dcn_parallelism` | Define mesh topology and sharding of params, activations, and KV caches across data/FSDP/tensor/sequence axes. |
