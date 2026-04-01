@@ -189,6 +189,24 @@ MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/m
 - Sharding layouts for parameters, decode state, and KV caches (`prefill_kv_cache_annotations` for prefill and `kv_cache_annotations` for autoregressive decode).
 - Optional paged-attention bookkeeping via `PageManager` when `attention: paged` is set, which allocates cache pages per request slot.
 
+### End-to-end inference pipeline (flowchart)
+
+```mermaid
+flowchart TD
+  R[Request (tokens, media)] --> P[Pad + optional chunk\n(existing_prefix splices cache)]
+  P --> Q[Reserve pages when paged attention enabled]
+  Q --> F[Prefill JIT (MODEL_MODE_PREFILL)]
+  F --> L[Flat logits + KV cache]
+  L --> S[Sample first token]
+  S --> C[Stack/unstuck cache\nprefill_kv_cache_annotations]
+  C --> D[Init decode state\nkv_cache_shardings]
+  D --> G[Generate step (_generate_jit)\nMODEL_MODE_AUTOREGRESSIVE]
+  G --> U[Update KV cache + next_pos]
+  U --> T[ResultTokens -> JetStream client]
+  U -->|loop until stop tokens/length| G
+  Q -.->|PageManager alloc/free| U
+```
+
 ### Prefill pipeline
 
 1. Inputs are padded to `max_prefill_predict_length` and optionally chunked (`use_chunked_prefill` / `prefill_chunk_size`). When an `existing_prefix` is supplied, the previous chunk's KV cache is spliced in and positions are offset so the next chunk continues prefilling the same prompt without recomputing earlier tokens.
