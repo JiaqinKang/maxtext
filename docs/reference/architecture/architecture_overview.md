@@ -191,7 +191,7 @@ MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/m
 
 ### Prefill pipeline
 
-1. Inputs are padded to `max_prefill_predict_length` and optionally chunked (`use_chunked_prefill` / `prefill_chunk_size`). When an `existing_prefix` is supplied, the previous chunk's KV cache is spliced in and positions are offset to resume mid-prompt.
+1. Inputs are padded to `max_prefill_predict_length` and optionally chunked (`use_chunked_prefill` / `prefill_chunk_size`). When an `existing_prefix` is supplied, the previous chunk's KV cache is spliced in and positions are offset so the next chunk continues prefilling the same prompt without recomputing earlier tokens.
 2. Under the JAX mesh and logical axis rules, the model runs in prefill mode, producing logits and a KV cache stored in the mutable `"cache"` collection. For paged attention, the page manager reserves pages for the slot before the JIT call.
 3. The engine samples the first generated token from the final timestep (respecting overrides for `algorithm`, `topk`, `nucleus_topp`, `temperature`) and returns it alongside the cached state and `next_pos` (advanced to the prompt length, plus any `mrope_deltas`).
 4. If `return_prompt_logp` is set, the engine also computes per-token log-probs from the flat logits. When `stack_prefill_result_cache` is enabled, caches are stacked along an extra axis (ordered by `prefill_cache_axis_order`) so a single prefill call can serve multiple packed prompts.
@@ -199,7 +199,7 @@ MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/m
 ### KV cache lifecycle
 
 - Prefill caches are produced with `prefill_kv_cache_shardings` and optionally stacked. Before decode, the engine "unboxes" and, if needed, unstacks the cache to match the decode-time layout (`kv_cache_shardings`).
-- In chunked or packed prefill, helper paths like `bulk_insert` and `insert_prefill` copy the prefill cache into the decode state's full KV buffers, zero-filling any uncovered timesteps and copying scale metadata (`cached_prefill_key/value(_scale)`).
+- In chunked or packed prefill, helper paths like `bulk_insert` and `insert_prefill` copy the prefill cache into the decode state's full KV buffers, zero-filling any future timesteps that were not part of the prefill chunk and copying the key/value scale tensors (`cached_prefill_key/value(_scale)`) that accompany quantized or paged caches.
 - With paged attention, `PageManager` assigns and later releases page groups per slot, letting long prompts reuse physical cache pages without reallocating HBM.
 
 ### Decode loop
@@ -211,7 +211,7 @@ MaxText's serving path is implemented by **MaxEngine** (`src/maxtext/inference/m
 ### How parallelism choices affect prefill, cache, and decode
 
 - **Mesh shape (`ici_parallelism`, `dcn_parallelism`) and axis rules** decide how both parameters and KV caches are partitioned. Data/FSDP axes replicate or shard caches across replicas; tensor/sequence axes shard head and sequence dimensions, reducing per-device KV size but requiring collective ops during attention.
-- **Stacked/packed prefill** (`stack_prefill_result_cache`, `prefill_cache_axis_order`) adds a leading stacking axis to the cache layout so a single compiled prefill can service multiple packed prompts; this changes sharding to include an extra `None` dimension.
+- **Stacked/packed prefill** (`stack_prefill_result_cache`, `prefill_cache_axis_order`) adds a leading stacking axis to the cache layout so a single compiled prefill can service multiple packed prompts; this changes sharding to include an extra `None` dimension (an unsharded, replicated axis in JAX sharding notation).
 - **Paged attention** moves KV cache residency from contiguous HBM blocks to reusable pages; with more data-parallel replicas, page allocations are independent per replica, while tensor-parallel layouts still shard keys/values within each page.
 - **Chunked prefill** keeps per-step activation and cache shapes bounded by `prefill_chunk_size`, which is especially important when the mesh uses narrow tensor-parallel slices (smaller per-device head dim) or deep pipeline stages. Larger meshes reduce wall-clock time per chunk but may increase collective overhead during cache stitching.
 - **Greedy vs. sampling decode** does not change sharding, but higher data-parallel width increases the number of concurrent decode states; ensure `per_device_batch_size` is sized so `per_device_batch_size * mesh.size` fits KV cache memory under the chosen parallel layout.
