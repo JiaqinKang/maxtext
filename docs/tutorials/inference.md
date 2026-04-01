@@ -50,6 +50,42 @@ If the plugin is not installed, please run the install post training extra depen
 install_maxtext_tpu_post_train_extra_deps
 ```
 
+# Native MaxText decode CLI
+
+If you want to run inference directly against the MaxEngine runtime (without vLLM), use the native CLI:
+
+```bash
+python3 -m maxtext.inference.decode \
+  model_name=qwen3-0.5b \
+  tokenizer_path=Qwen/Qwen2-0.5B \
+  load_parameters_path=$CHECKPOINT_PATH \
+  prompt="Hello MaxText!" \
+  ici_mesh_shape="[1,1,1,1]" \
+  ici_tensor_parallelism=1 \
+  decode_sampling_temperature=0.7
+```
+
+Key flags:
+- `model_name`, `tokenizer_path`, `load_parameters_path`: model and checkpoint to load.
+- `ici_mesh_shape`, `ici_tensor_parallelism`, `dcn_data_parallelism`: device layout (set according to your TPU/CPU/GPU topology).
+- `prompt`, `max_prefill_predict_length`, `decode_sampling_*`: text to generate and sampling controls.
+
+High-level execution path:
+
+```mermaid
+flowchart TD
+  A[Parse CLI/config] --> B[Load tokenizer + params]
+  B --> C[Build mesh + compile\nprefill/decode JITs]
+  C --> D[Prefill prompt\npad/chunk + KV cache]
+  D --> E[Sample first token]
+  E --> F[Autoregressive loop\n_generate_jit]
+  F --> G[Update KV cache + next_pos]
+  G --> H[Stream/print tokens]
+  G -->|until stop/length| F
+```
+
+This CLI exercises the same MaxEngine path described in the architecture docs (prefill → cache handoff → decode loop), making it the simplest way to validate a checkpoint without vLLM.
+
 # Offline Inference
 
 We include a script for convenient offline inference of MaxText models in `src/maxtext/inference/vllm_decode.py`. This is helpful to ensure correctness of MaxText checkpoints. This script invokes the [`LLM`](https://docs.vllm.ai/en/latest/serving/offline_inference/#offline-inference) API from vLLM.
@@ -79,6 +115,30 @@ An example of how to run this script can be found below:
 ```
 
 In the command above we pass in the `vllm_hf_overrides='{architectures: ["MaxTextForCausalLM"]}'` argument. This argument tells vLLM to use the MaxText implementation of the target model architecture.
+
+# Inference microbenchmark
+
+To measure prefill and decode performance without serving overhead, run the microbenchmark harness:
+
+```bash
+python3 -m maxtext.inference.inference_microbenchmark \
+  model_name=qwen3-0.5b \
+  tokenizer_path=Qwen/Qwen2-0.5B \
+  load_parameters_path=$CHECKPOINT_PATH \
+  batch_size_prefill=4 \
+  batch_size_decode=4 \
+  prefill_predict_length=1024 \
+  decode_length=128 \
+  num_steps=10
+```
+
+What happens:
+1. Loads the model/config, builds the device mesh, and compiles two JITs: prefill and single-step decode.
+2. Runs warmup steps to amortize compilation.
+3. Measures latency/throughput for prefill and the autoregressive loop, printing per-step and aggregate stats.
+4. Uses the same MaxEngine code paths as the decode CLI, but feeds synthetic tokens to isolate model/mesh performance.
+
+For sweep-style studies, see `src/maxtext/inference/inference_microbenchmark_sweep.py`, which iterates over batch sizes and sequence lengths and dumps results to CSV.
 
 # Online Inference
 
