@@ -117,6 +117,7 @@ class MaxEngine(_BaseEngine):
     self.replicated_sharding = jax.sharding.NamedSharding(self._mesh, P(None))
 
     self.abstract_params = None
+    self.param_shardings = None
     self.prefill_kv_cache_annotations = None
     self.kv_cache_annotations = None
     self.kv_cache_annotations_named = None
@@ -276,6 +277,11 @@ class MaxEngine(_BaseEngine):
       params = self.quantize_params(state, rng3)
     else:
       params = state.params
+
+    self.param_shardings = jax.tree_util.tree_map(
+        lambda x: x.sharding if isinstance(x, jax.Array) else self.replicated_sharding,
+        params,
+    )
 
     self.print_stats("After load_params")
 
@@ -471,6 +477,7 @@ class MaxEngine(_BaseEngine):
 
     start_position = 0
     previous_chunk = None
+    params = jax.lax.with_sharding_constraint(params, self.param_shardings)
     input_params = params
     if existing_prefix is not None:
       if not self.use_chunked_prefill:
@@ -1026,6 +1033,7 @@ class MaxEngine(_BaseEngine):
 
     previous_token = decode_state["tokens"]
     rng, new_rng = jax.random.split(rng)
+    params = jax.lax.with_sharding_constraint(params, self.param_shardings)
     # run one step generation
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       out_logits, new_vars = self.model.apply(
