@@ -33,7 +33,8 @@ if __name__ == "__main__":
       # Rewrite argv[0] to the real module path so pyconfig can resolve the
       # correct default config via _CONFIG_FILE_MAPPING.
       argv = list(sys.argv)
-      argv[0] = _new_module.__file__
+      if _new_module.__file__ is not None:
+        argv[0] = _new_module.__file__
       _new_module.main(argv)
   except ImportError as e:
     max_logging.error(f"Shim could not find target module: '{NEW_MODULE_PATH}'\n")

@@ -38,7 +38,8 @@ if __name__ == "__main__":
       # Rewrite argv[0] to the real module path so pyconfig can resolve the
       # correct default config via _CONFIG_FILE_MAPPING.
       argv = list(sys.argv)
-      argv[0] = _new_module.__file__
+      if _new_module.__file__ is not None:
+        argv[0] = _new_module.__file__
       cfg = pyconfig.initialize(argv)
       _new_module.main(cfg)
   except ImportError as e:
